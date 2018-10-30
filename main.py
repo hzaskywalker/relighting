@@ -3,7 +3,7 @@ from torch import nn
 import tqdm
 import argparse
 import numpy as np
-from networks import RelightNet, SampleNet
+from networks import RelightNet, SampleNet, AdaptiveSampling
 from data.coefs import dirs
 from dataloader import get_train_data
 from utils import resume_if_exists, save, Visualizer
@@ -11,10 +11,15 @@ from utils import resume_if_exists, save, Visualizer
 Light = torch.tensor(np.float32(dirs)).cuda() ## 1053 * 3 * 8 * 8
 
 class RelightNetwork(nn.Module):
-    def __init__(self, num_lights, num_samples):
+    def __init__(self, num_lights, num_samples, type_sampler):
         nn.Module.__init__(self)
-        self.sample = SampleNet(num_lights, num_samples)
-        self.relighter = RelightNet(4, 5 * num_samples, 64)
+        if type_sampler == 'original':
+            self.sample = SampleNet(num_lights, num_samples)
+            print(self.sample.output_dim)
+        elif type_sampler == 'adaptive':
+            self.sample = AdaptiveSampling(num_lights, num_samples)
+
+        self.relighter = RelightNet(4, self.sample.output_dim, 64)
 
     def forward(self, inps, ws, alpha=5):
         ## padd the light_direction 
@@ -37,6 +42,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_lights', type=int, default=1053)
     parser.add_argument('--num_samples', type=int, default=5)
+    parser.add_argument('--sampler', type=str, default='original', choices=['original', 'adaptive'])
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--num_scene', type=int, default=4)
@@ -46,7 +52,7 @@ def main():
     parser.add_argument('--dataset_path', type=str, default='/home/hza/data/rendering/cropped.hdf5')
     args = parser.parse_args()
 
-    net = RelightNetwork(args.num_lights, args.num_samples).cuda()
+    net = RelightNetwork(args.num_lights, args.num_samples, type_sampler=args.sampler).cuda()
     optim = torch.optim.Adam(net.parameters(), args.lr)
     def zipper(net, optim):
         return {'optim':optim, 'net': net}
@@ -100,12 +106,18 @@ def main():
                 toshow = np.maximum(toshow, -1)
                 toshow = (toshow * 127.5 + 127.5).astype(np.uint8)
 
-                mask = nn.functional.softmax(net.sample.mask*T, dim=0).cpu().detach().numpy()
-                inds = mask.argmax(axis=0)
-                values = [mask[inds[i], i] for i in range(inds.shape[0])]
-                if j == 0:
-                    print(inds, values)
-                viewer({'img': toshow})
+                if j % 3000 == 0:
+                    if args.sampler == 'original':
+                        mask = [ nn.functional.softmax(net.sample.mask*T, dim=0).cpu().detach().numpy() ]
+                    else:
+                        mask = net.sample.extra_output
+
+                    for mask in mask:
+                        inds = mask.argmax(axis=0)
+                        values = [mask[inds[i], i] for i in range(inds.shape[0])]
+                        print(inds, values)
+    
+                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy()})
 
         dict = zipper(net, optim)
         save(args.path, dict, epochs)

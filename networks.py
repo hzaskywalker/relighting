@@ -74,6 +74,16 @@ class RelightNet(nn.Module):
     def forward(self, x, ws):
         return self.post(self.main(x, ws))
 
+def sample(inps, mask):
+    ## inps (b, 1053, xxx)
+    ## mask (1053, k)
+    inps = inps.transpose(0, 1)
+    size = inps.size()
+    inps = inps.reshape(inps.size(0), -1)
+    ans = mask.transpose(1, 0) @ inps
+    ans = ans.reshape(-1, *size[1:]).transpose(0, 1).contiguous()
+    ans = ans.view(ans.size(0), -1, *ans.size()[3:])
+    return ans
 
 class SampleNet(nn.Module):
     def __init__(self, num_lights, num_samples):
@@ -81,24 +91,126 @@ class SampleNet(nn.Module):
         self.num_lights = num_lights
         self.K = num_samples
         self.mask = nn.Parameter(torch.randn(num_lights, num_samples))
+        self.output_dim = num_samples * 5
 
     def forward(self, inps, alpha=8):
         #inps (scene, num_lights, k, size, size)
 
         mask = torch.nn.functional.softmax(self.mask * alpha, dim=0)
         #ans = (inps[:,:,None] * mask[None, :, :, None, None,None]).sum(dim=1)
-        inps = inps.transpose(0, 1)
-        size = inps.size()
-        inps = inps.reshape(inps.size(0), -1)
-        ans = mask.transpose(1, 0) @ inps
-        ans = ans.reshape(-1, *size[1:]).transpose(0, 1).contiguous()
-        ans = ans.view(ans.size(0), -1, *ans.size()[3:])
-        return ans
+        return sample(inps, mask)
 
+
+
+
+class UNet(nn.Module):
+    def __init__(self, d, inp_dim, oup_dim):
+        nn.Module.__init__(self)
+        self.d = d
+        self.inp_dim = inp_dim
+        self.oup_dim = oup_dim
+        if d > 0:
+            self.down = nn.Sequential(
+                nn.Conv2d(inp_dim, oup_dim, 3, stride=2,padding=1),
+                nn.BatchNorm2d(oup_dim),
+                nn.ReLU(),
+            )
+
+            self.relightA = UNet(d-1, oup_dim, oup_dim * 2)
+
+
+            dim = self.relightA.oup_dim
+            self.up = nn.Sequential(
+                nn.ConvTranspose2d(dim, oup_dim, 3, stride=2,padding=1, output_padding=1),
+                nn.BatchNorm2d(oup_dim),
+                nn.ReLU()
+            )
+            self.oup_dim = oup_dim + inp_dim
+        else:
+            self.main = nn.Sequential(
+                nn.Conv2d(inp_dim, inp_dim, 3, stride=1,padding=1),
+                nn.BatchNorm2d(inp_dim),
+                nn.ReLU(),
+            )
+            self.oup_dim = inp_dim
+
+    def forward(self, x):
+        if self.d == 0: 
+            out = self.main(x)
+        else:
+            down = self.down(x)
+            tmp = self.relightA(down)
+            up = self.up(tmp)
+            out = torch.cat((x, up), dim=1)
+        return out
+
+class AdaptiveSampleNet(nn.Module):
+    def __init__(self, hidden_dim, num_lights):
+        nn.Module.__init__(self)
+        from resnet import resnet18
+        self.main = resnet18(inp_dim=hidden_dim, num_classes=num_lights)
+
+    def forward(self, x):
+        return self.main(x)
 
 class AdaptiveSampling(nn.Module):
-    def __init__(self, num_lights, num_samples):
+    def __init__(self, num_lights=1053, num_samples=5, hidden_dim=32, inp_dim=5):
         nn.Module.__init__(self)
+        self.num_lights = num_lights
+        self.hidden_dim = hidden_dim
+        self.inp_dim = inp_dim
+        self.num_samples = num_samples
 
-    def forward(self, memory, alpah=8):
-        pass
+        self.fusionNet = nn.Sequential(
+            UNet(4, hidden_dim + inp_dim, hidden_dim),
+            nn.Conv2d(hidden_dim * 2+inp_dim, hidden_dim, 3, stride=1, padding=1), # can be changed to variational autoencoder
+        )
+
+        self.sampleNet = AdaptiveSampleNet(hidden_dim, num_lights * num_samples)
+        self.output_dim = hidden_dim
+        #self.output_dim = num_samples * inp_dim
+
+    def forward(self, inps, alpha=1.):
+        # inps (b, 1053, c, w, h)
+        init = (inps[:,0, 0:1] * 0).expand(inps.size(0), self.hidden_dim, inps.size(3), inps.size(4))
+        outs = []
+        self.extra_output = []
+        for i in range(self.num_samples):
+            mask = torch.nn.functional.softmax( self.sampleNet(init)[:, i*self.num_lights:(i+1)*self.num_lights] * alpha) #(b, 1053)
+            self.extra_output.append(mask)
+            sampled = (inps * mask[:,:,None,None,None]).sum(dim=1)
+            init = self.fusionNet(torch.cat((init, sampled), dim=1)) ## here we need to change to residual block
+            outs.append(sampled)
+        self.extra_output = torch.stack(self.extra_output, dim=2).cpu().detach().numpy()
+        return init
+
+class GausianSampling(nn.Module):
+    def __init__(self, num_lights=1053, num_samples=5, hidden_dim=32, inp_dim=5):
+        nn.Module.__init__(self)
+        self.num_lights = num_lights
+        self.hidden_dim = hidden_dim
+        self.inp_dim = inp_dim
+        self.num_samples = num_samples
+
+        self.fusionNet = nn.Sequential(
+            UNet(4, hidden_dim + inp_dim, hidden_dim),
+            nn.Conv2d(hidden_dim * 2+inp_dim, hidden_dim, 3, stride=1, padding=1), # can be changed to variational autoencoder
+        )
+
+        self.sampleNet = AdaptiveSampleNet(hidden_dim, num_lights * num_samples)
+        self.output_dim = hidden_dim
+        #self.output_dim = num_samples * inp_dim
+
+    def forward(self, inps, alpha=1.):
+        # inps (b, 1053, c, w, h)
+        init = (inps[:,0, 0:1] * 0).expand(inps.size(0), self.hidden_dim, inps.size(3), inps.size(4))
+        outs = []
+        self.extra_output = []
+        for i in range(self.num_samples):
+            mask = torch.nn.functional.softmax( self.sampleNet(init)[:, i*self.num_lights:(i+1)*self.num_lights] * alpha) #(b, 1053)
+            self.extra_output.append(mask)
+            sampled = (inps * mask[:,:,None,None,None]).sum(dim=1)
+            init = self.fusionNet(torch.cat((init, sampled), dim=1))
+            outs.append(sampled)
+        self.extra_output = torch.stack(self.extra_output, dim=2).cpu().detach().numpy()
+        return init
