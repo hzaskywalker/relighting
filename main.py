@@ -3,10 +3,10 @@ from torch import nn
 import tqdm
 import argparse
 import numpy as np
-from networks import RelightNet, SampleNet, AdaptiveSampling
-from data.coefs import dirs
+from networks import RelightNet, SampleNet, AdaptiveSampling, GaussianSampling, BasicAdaptiveSampling
+from data.coefs import dirs, angles
 from dataloader import get_train_data
-from utils import resume_if_exists, save, Visualizer
+from utils import resume_if_exists, save, Visualizer, viewDirection
 
 Light = torch.tensor(np.float32(dirs)).cuda() ## 1053 * 3 * 8 * 8
 
@@ -18,6 +18,10 @@ class RelightNetwork(nn.Module):
             print(self.sample.output_dim)
         elif type_sampler == 'adaptive':
             self.sample = AdaptiveSampling(num_lights, num_samples)
+        elif type_sampler == 'gaussian':
+            self.sample = GaussianSampling(num_lights, num_samples)
+        elif type_sampler == 'basicAdaptive':
+            self.sample = BasicAdaptiveSampling(num_lights, num_samples)
 
         self.relighter = RelightNet(4, self.sample.output_dim, 64)
 
@@ -42,7 +46,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_lights', type=int, default=1053)
     parser.add_argument('--num_samples', type=int, default=5)
-    parser.add_argument('--sampler', type=str, default='original', choices=['original', 'adaptive'])
+    parser.add_argument('--degree', type=int, default=45, choices=[45, 90])
+    parser.add_argument('--sampler', type=str, default='original', choices=['original', 'adaptive', 'gaussian', 'basicAdaptive'])
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--num_scene', type=int, default=4)
@@ -52,6 +57,13 @@ def main():
     parser.add_argument('--dataset_path', type=str, default='/home/hza/data/rendering/cropped.hdf5')
     args = parser.parse_args()
 
+    if args.degree is not None:
+        degree = args.degree / 180. * np.pi
+        args.num_lights = (angles <= degree).sum()
+        global Light
+        Light = Light[np.where(angles<=degree)]
+    print('NUM_LIGHT:', args.num_lights)
+
     net = RelightNetwork(args.num_lights, args.num_samples, type_sampler=args.sampler).cuda()
     optim = torch.optim.Adam(net.parameters(), args.lr)
     def zipper(net, optim):
@@ -59,7 +71,7 @@ def main():
 
     resume_if_exists(args.path, zipper(net, optim))
     ## todo: tensorboard for relightling effects   
-    data = get_train_data(num_workers = args.num_workers, batch_size=args.num_scene, path=args.dataset_path, num_light=args.num_lights, num_split=args.num_gt)
+    data = get_train_data(num_workers = args.num_workers, batch_size=args.num_scene, path=args.dataset_path, degree=args.degree, num_split=args.num_gt)
     viewer = Visualizer(args.path)
 
     for epochs in range(args.num_epochs):
@@ -69,6 +81,7 @@ def main():
         for j in tqdm.trange(num_batchs):
             ids = (epochs + float(j)/num_batchs)
             T = 1 + 5 * (ids+ 0.0) ** 2.0
+            #T = 1 + 1000 * (ids+ 0.0) ** 2.0
 
             tmp = next(b)
             inps = tmp[0].cuda()
@@ -106,18 +119,24 @@ def main():
                 toshow = np.maximum(toshow, -1)
                 toshow = (toshow * 127.5 + 127.5).astype(np.uint8)
 
-                if j % 3000 == 0:
-                    if args.sampler == 'original':
-                        mask = [ nn.functional.softmax(net.sample.mask*T, dim=0).cpu().detach().numpy() ]
-                    else:
-                        mask = net.sample.extra_output
+                #if j % 3000 == 0:
+                if args.sampler == 'original':
+                    mask = [ nn.functional.softmax(net.sample.mask*T, dim=0).cpu().detach().numpy() ]
+                else:
+                    mask = net.sample.extra_output
 
-                    for mask in mask:
-                        inds = mask.argmax(axis=0)
-                        values = [mask[inds[i], i] for i in range(inds.shape[0])]
-                        print(inds, values)
+                imgs = []
+                for mask in mask:
+                    #inds = mask.argmax(axis=0)
+                    #values = [mask[inds[i], i] for i in range(inds.shape[0])]
+                    tmp = []
+                    for j in range(mask.shape[1]):
+                        tmp.append( viewDirection(mask[:, j], args.degree, 31) )
+                    tmp = np.concatenate(tmp, axis=1)
+                    imgs.append(tmp)
+                imgs = np.float32(np.concatenate(imgs))
     
-                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy()})
+                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy(), 'attention': imgs[None,None,:]})
 
         dict = zipper(net, optim)
         save(args.path, dict, epochs)

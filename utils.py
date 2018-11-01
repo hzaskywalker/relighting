@@ -127,6 +127,18 @@ class Visualizer(object):
         self.dfs('', outputs)
         self.tb.tick()
 
-def ViewDirection(dirs):
+def viewDirection(weights, degree, size):
     ## dirs (1053 * 3)
-    pass
+    from data.coefs import coefs, angles
+    degree = degree / 180. * np.pi
+
+    mask = (angles <= degree)
+    loc = coefs[mask]
+
+    x = np.int32(np.round(loc[:,0] * size))
+    y = np.int32(np.round(loc[:,1] * size))
+    img = np.zeros((size, size))
+    for x, y, w in zip(x, y, weights):
+        img[y, x] = w
+    img = img/img.max()
+    return img

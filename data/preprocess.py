@@ -9,17 +9,24 @@ from torch import nn
 import numpy as np
 
 class Dataset:
-    def __init__(self, path='/home/hza/data/rendering/orgTrainingImages/Shape_Multi_500_full/train/imgs'):
+    def __init__(self, path='/media/hza/13f7e693-f10f-4ea3-afff-511e84f3500a/data/orgTrainingImages/Shape_Multi_500_full/train/imgs'):
         self.path = path
         dataFolder = self.path
         num = 0
         for i in sorted(glob.glob(os.path.join(self.path, 'Shape__*'))):
             num += 1
+        print(num)
         files = [os.path.join(self.path, 'Shape__{}'.format(i), '0', 'inters') for i in range(500)]
         img_paths = []
-        for i in range(num):
+        for i in tqdm.trange(num):
             tmp = []
-            for j in sorted(os.listdir(files[i])):
+            file_name = os.listdir(files[i])
+            files_name_ind = [int(j.split('_')[0]) for j in file_name]
+            index = np.argsort(files_name_ind)
+            file_name = [file_name[j] for j in index]
+            if i == 0:
+                print(file_name)
+            for j in file_name:
                 tmp.append(os.path.join(files[i], j))
             img_paths.append(tmp)
         self.imgs = img_paths
@@ -58,7 +65,7 @@ class Dataset:
 
 def play():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--size', default=64)
+    parser.add_argument('--size', default=64, type=int)
     args = parser.parse_args()
 
     dataset = Dataset()

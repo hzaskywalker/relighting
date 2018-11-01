@@ -5,12 +5,18 @@ import numpy as np
 import tqdm
 import h5py
 from torch.utils.data import Dataset, DataLoader
+from data.coefs import angles
 
 class CustomTensorDataset(Dataset):
-    def __init__(self, path, num_light, num_split):
+    def __init__(self, path, degree, num_split):
         self.dataset = None
         self.path = path
-        self.num_light = num_light
+
+        degree = degree / 180. * np.pi
+        self.mask = (angles <= degree)
+        self.where = np.where(self.mask)
+        self.num_light = self.mask.sum()
+
         self.length = 500 * 10
         self.num_split = num_split
         self.prepare()
@@ -40,7 +46,7 @@ class CustomTensorDataset(Dataset):
     def __getitem__(self, index):
         self.open()
         index, toadd = self.data_list[index]
-        return torch.tensor(self.dataset[index*self.num_light:(index+1)*self.num_light]), torch.tensor(np.array(toadd))
+        return torch.tensor(self.dataset[index*1053:(index+1)*1053])[self.where], torch.tensor(np.array(toadd))
 
 def get_train_data(batch_size, num_workers, **train_kwargs):
     train_data = CustomTensorDataset(**train_kwargs)
