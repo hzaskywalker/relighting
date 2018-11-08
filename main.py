@@ -3,7 +3,7 @@ from torch import nn
 import tqdm
 import argparse
 import numpy as np
-from networks import RelightNet, SampleNet, AdaptiveSampling, GaussianSampling, BasicAdaptiveSampling
+from networks import RelightNet, SampleNet, AdaptiveSampling, BasicAdaptiveSampling, Sampler
 from data.coefs import dirs, angles
 from dataloader import get_train_data
 from utils import resume_if_exists, save, Visualizer, viewDirection
@@ -11,15 +11,17 @@ from utils import resume_if_exists, save, Visualizer, viewDirection
 Light = torch.tensor(np.float32(dirs)).cuda() ## 1053 * 3 * 8 * 8
 
 class RelightNetwork(nn.Module):
-    def __init__(self, num_lights, num_samples, type_sampler):
+    def __init__(self, num_lights, num_samples, type_sampler, sample_methods='sum', Light=None):
         nn.Module.__init__(self)
         if type_sampler == 'original':
             self.sample = SampleNet(num_lights, num_samples)
             print(self.sample.output_dim)
         elif type_sampler == 'adaptive':
             self.sample = AdaptiveSampling(num_lights, num_samples)
-        elif type_sampler == 'gaussian':
-            self.sample = GaussianSampling(num_lights, num_samples)
+        elif type_sampler == 'gaussian' or type_sampler == 'categorical':
+            sampler = Sampler(sample_methods)
+            self.sample = AdaptiveSampling(Light, type_sampler, sampler, num_samples)
+
         elif type_sampler == 'basicAdaptive':
             self.sample = BasicAdaptiveSampling(num_lights, num_samples)
 
@@ -34,12 +36,15 @@ class RelightNetwork(nn.Module):
         inps = torch.cat((inps, to_pad), dim=2) #(b, K', f, w, h)
 
         inps = self.sample(inps, alpha) #(b, K, f, w, h)
+        logp = 0
+        if type(inps) is tuple or type(inps) is list:
+            inps, logp = inps
 
         inps = inps[:,None].expand((inps.size(0), ws.size(1),)+inps.size()[1:])
         inps = inps.contiguous().view(inps.size(0)*inps.size(1), *inps.size()[2:]) # b*num_relight, K, f, w, h
         ws = ws.view(-1, 2)
 
-        return self.relighter(inps, ws)
+        return self.relighter(inps, ws), logp
 
 
 def main():
@@ -47,7 +52,8 @@ def main():
     parser.add_argument('--num_lights', type=int, default=1053)
     parser.add_argument('--num_samples', type=int, default=5)
     parser.add_argument('--degree', type=int, default=45, choices=[45, 90])
-    parser.add_argument('--sampler', type=str, default='original', choices=['original', 'adaptive', 'gaussian', 'basicAdaptive'])
+    parser.add_argument('--sampler', type=str, default='original', choices=['original', 'gaussian', 'categorical', 'basicAdaptive'])
+    parser.add_argument('--methods', type=str, default='sum', choices=['sum', 'sample'])
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--num_scene', type=int, default=4)
@@ -64,7 +70,7 @@ def main():
         Light = Light[np.where(angles<=degree)]
     print('NUM_LIGHT:', args.num_lights)
 
-    net = RelightNetwork(args.num_lights, args.num_samples, type_sampler=args.sampler).cuda()
+    net = RelightNetwork(args.num_lights, args.num_samples, type_sampler=args.sampler, sample_methods=args.methods, Light=Light).cuda()
     optim = torch.optim.Adam(net.parameters(), args.lr)
     def zipper(net, optim):
         return {'optim':optim, 'net': net}
@@ -105,12 +111,16 @@ def main():
             ws = torch.stack(ws, dim=0)
 
             optim.zero_grad()
-            out = net(inps, ws, alpha=T)
+            out, logp = net(inps, ws, alpha=T)
 
             gts = gts.view(gts.size(0)*gts.size(1), *gts.size()[2:])
-            loss = nn.functional.mse_loss(out, gts)
+            loss = ((out - gts)**2).mean(dim=3).mean(dim=2).mean(dim=1)#nn.functional.mse_loss(out, gts)
 
-            loss.backward()
+            adv = loss.detach().reshape(len(inps), -1).sum(dim=1)
+            prob_loss = (adv * logp).mean()
+            total_loss = loss.mean() + prob_loss
+
+            total_loss.backward()
             optim.step()
 
             if j % 100 == 0:
@@ -136,7 +146,7 @@ def main():
                     imgs.append(tmp)
                 imgs = np.float32(np.concatenate(imgs))
     
-                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy(), 'attention': imgs[None,None,:]})
+                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy(), 'prob_loss': prob_loss.cpu().detach().numpy(), 'attention': imgs[None,None,:]})
 
         dict = zipper(net, optim)
         save(args.path, dict, epochs)
