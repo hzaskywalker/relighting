@@ -142,3 +142,33 @@ def viewDirection(weights, degree, size):
         img[y, x] = w
     img = img/img.max()
     return img
+
+def getLight(degree):
+    degree = degree / 180. * np.pi
+    from data.coefs import dirs, angles
+    num_lights = (angles <= degree).sum()
+
+    Light = torch.tensor(np.float32(dirs)).cuda() ## 1053 * 3 * 8 * 8
+    return Light[np.where(angles<=degree)]
+
+def handle_data(tmp, Light):
+    inps = tmp[0].cuda()
+    inps = (inps.permute(0, 1, 4, 2, 3).float() - 127.5)/127.5
+    ws = []
+    gts = []
+
+    light_ids = tmp[1].numpy()
+    for scene_id in range(len(inps)):
+        w = []
+        gt = []
+        for k in range(len(light_ids[scene_id])):
+            #sampled = np.random.randint(args.num_lights)
+            sampled = light_ids[scene_id][k]
+            w.append(Light[sampled])
+            gt.append(inps[scene_id][sampled])
+        ws.append(torch.stack(w, dim=0))
+        gts.append(torch.stack(gt, dim=0))
+
+    gts = torch.stack(gts, dim=0)
+    ws = torch.stack(ws, dim=0)
+    return inps, gts, ws

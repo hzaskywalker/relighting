@@ -9,7 +9,7 @@ from torch import nn
 import numpy as np
 
 class Dataset:
-    def __init__(self, path='/media/hza/13f7e693-f10f-4ea3-afff-511e84f3500a/data/orgTrainingImages/Shape_Multi_500_full/train/imgs'):
+    def __init__(self, path='/home/hza/data/rendering/test/Shape_Multi_100_full/test/imgs'):
         self.path = path
         dataFolder = self.path
         num = 0
@@ -69,7 +69,7 @@ def play():
     args = parser.parse_args()
 
     dataset = Dataset()
-    dataset.createF5py(size=args.size, path='/home/hza/data/rendering/cropped_{}.hdf5'.format(args.size))
+    dataset.createF5py(size=args.size, path='/home/hza/data/rendering/cropped_test_{}.hdf5'.format(args.size))
 
 if __name__ == '__main__':
     play()

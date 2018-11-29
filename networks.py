@@ -74,6 +74,22 @@ class RelightNet(nn.Module):
     def forward(self, x, ws):
         return self.post(self.main(x, ws))
 
+
+class RelightNetWithMax(nn.Module):
+    def __init__(self, d, inp_dim, oup_dim, mid_dim=32):
+        self.unet = UNet(4, inp_dim, mid_dim)
+        self.relight = RelightNet(d, self.unet.oup_dim, oup_dim)
+
+    def forward(self, inps, ws):
+        ans = []
+        for i in range(inps.size(0)):
+            k = inps[i]
+            out, _ = self.unet(k).max(dim=0)
+            ans.append(out)
+        ans = torch.stack(ans, dim=0)
+        return self.relight(ans, ws)
+
+
 def sample(inps, mask):
     ## inps (b, 1053, xxx)
     ## mask (1053, k)
@@ -174,49 +190,6 @@ class EncodeNet(nn.Module):
         x = self.main(x)
         x = x.mean(dim=3).mean(dim=2)
         return x
-
-class BasicAdaptiveSampling(nn.Module):
-    def __init__(self, num_lights, num_samples=5, inp_dim=5):
-        nn.Module.__init__(self)
-
-        self.num_samples = num_samples
-        model_list = []
-        hidden_dim = 32
-        for i in range(num_samples):
-            nets = EncodeNet(4, inp_dim * (i+1), hidden_dim)
-            model_list.append(
-                nn.Sequential(
-                    nets,
-                    nn.Linear(nets.output_dim, num_lights)
-                )
-            )
-        self.models = nn.ModuleList(model_list)
-        self.num_lights = num_lights
-        self.init_mask = nn.Parameter(torch.ones(num_lights,))
-        self.output_dim = num_samples * inp_dim
-
-    def forward(self, inps, alpha=1.0):
-        pre = None
-        self.extra_output = []
-        for i in range(self.num_samples):
-            if i == 0:
-                mask = self.init_mask[None,:].expand(inps.size(0), self.num_lights) + 1.
-            else:
-                mask = self.models[i-1](pre)
-
-            mask = torch.nn.functional.softmax( mask * alpha)
-            self.extra_output.append(mask)
-            sampled = (inps * mask[:,:,None,None,None]).sum(dim=1)
-            if pre is None:
-                pre = sampled
-            else:
-                pre = torch.cat((pre, sampled), dim=1)
-
-        self.extra_output = torch.stack(self.extra_output, dim=2).cpu().detach().numpy()
-        return pre
-
-
-
 
 class Sampler(nn.Module):
     def __init__(self, sample_methods='sum'):

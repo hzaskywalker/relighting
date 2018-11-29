@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from data.coefs import angles
 
 class CustomTensorDataset(Dataset):
-    def __init__(self, path, degree, num_split):
+    def __init__(self, path, degree, num_split, length=500):
         self.dataset = None
         self.path = path
 
@@ -17,7 +17,7 @@ class CustomTensorDataset(Dataset):
         self.where = np.where(self.mask)
         self.num_light = self.mask.sum()
 
-        self.length = 500 * 10
+        self.length = length * 10
         self.num_split = num_split
         self.prepare()
 

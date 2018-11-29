@@ -22,9 +22,6 @@ class RelightNetwork(nn.Module):
             sampler = Sampler(sample_methods)
             self.sample = AdaptiveSampling(Light, type_sampler, sampler, num_samples)
 
-        elif type_sampler == 'basicAdaptive':
-            self.sample = BasicAdaptiveSampling(num_lights, num_samples)
-
         self.relighter = RelightNet(4, self.sample.output_dim, 64)
 
     def forward(self, inps, ws, alpha=5):
