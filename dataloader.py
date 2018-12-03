@@ -36,7 +36,6 @@ class CustomTensorDataset(Dataset):
 
     def __len__(self):
         return len(self.data_list)
-        #return len(self.dataset)//self.num_light
 
     def open(self):
         if self.dataset is None:

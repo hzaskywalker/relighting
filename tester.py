@@ -84,7 +84,9 @@ def testNotFixLength(path='exp/max_relighter/ckpt.t7'):
     tester = Tester(path='/home/hza/data/rendering/cropped_test_64.hdf5', degree=degree, num_split=18, batch_size=4)
 
     director = RandomNextDirection(len(light))
+    #from train_baseline import director
 
+   
     def make_func(num_samples):
         def func(inps, ws):
             state = extractor.init_state(inps)
@@ -105,9 +107,103 @@ def testNotFixLength(path='exp/max_relighter/ckpt.t7'):
             return output
         return func
 
-    print( tester(make_func(2), light, num=100) )
-    print( tester(make_func(5), light, num=100) )
-    print( tester(make_func(10), light, num=100) )
+    #print( tester(make_func(2), light, num=100) )
+    #print( tester(make_func(5), light, num=100) )
+    #print( tester(make_func(10), light, num=100) )
+    print( tester(make_func(4), light, num=100) )
+
+def testBaseline(path='exp/relight_baseline/ckpt.t7'):
+    from network2 import UnetExtractor, RelightNet, RandomNextDirection, expand_ws
+    from train_baseline import director
+    from utils import getLight
+
+    degree = 45
+
+    light = getLight(degree)
+
+    relighter = RelightNet(4, 20, 64).cuda()
+
+    net_dic = torch.load(path)
+    relighter.load_state_dict(net_dic['relighter'])
+
+    relighter.eval()
+
+    from train_baseline import director
+
+    tester = Tester(path='/home/hza/data/rendering/cropped_test_64.hdf5', degree=degree, num_split=18, batch_size=4)
+
+    def make_func(num_samples):
+        def func(inps, ws):
+            state = []
+            inps = director.add_padding(inps, light)
+
+            for j in range(num_samples):
+                next_directions_mask = director(inps, j)
+                sampled_image = director.sample(inps, next_directions_mask)
+
+                state.append(sampled_image)
+            state = torch.cat(state, dim=1)
+
+            state = expand_ws(state, ws)
+            ws = ws.view(-1, 2)
+            assert state.shape[0] == ws.shape[0]
+            output = relighter(state, ws)
+            output = output.view(len(inps), -1, *output.size()[1:])
+            return output
+        return func
+
+    print( tester(make_func(4), light, num=1000) )
+
+def testSetSeT(path='exp/set_set/ckpt.t7'):
+    from network2 import SetExtractor, SetRelighter, RandomNextDirection, expand_ws
+    from utils import getLight
+
+    degree = 45
+
+    light = getLight(degree)
+
+    extractor = SetExtractor(4, 5, 32).cuda()
+    relighter = SetRelighter(4, extractor.output_dim, 64).cuda()
+
+    net_dic = torch.load(path)
+    extractor.load_state_dict(net_dic['extractor'])
+    relighter.load_state_dict(net_dic['relighter'])
+
+    extractor.eval()
+    relighter.eval()
+
+    tester = Tester(path='/home/hza/data/rendering/cropped_test_64.hdf5', degree=degree, num_split=18, batch_size=4)
+
+    director = RandomNextDirection(len(light))
+    #from train_baseline import director
+
+   
+    def make_func(num_samples):
+        def func(inps, ws):
+            state = extractor.init_state(inps)
+            inps = director.add_padding(inps, light)
+
+            for j in range(num_samples):
+                next_directions_mask = director(state, j)
+                sampled_image = director.sample(inps, next_directions_mask)
+
+                new_state = extractor(sampled_image)
+                state = extractor.add_state(state, new_state)
+
+            state = expand_ws(state, ws)
+            ws = ws.view(-1, 2)
+            assert state.shape[0] == ws.shape[0]
+            output = relighter(state, ws)
+            output = output.view(len(inps), -1, *output.size()[1:])
+            return output
+        return func
+
+    #print( tester(make_func(2), light, num=100) )
+    #print( tester(make_func(5), light, num=100) )
+    #print( tester(make_func(10), light, num=100) )
+    #print( tester(make_func(4), light, num=100) )
 
 if __name__ == '__main__':
-    testNotFixLength()
+    #testNotFixLength()
+    testBaseline()
+    #testSetSeT()

@@ -57,7 +57,7 @@ class UNet(nn.Module):
         return out
 
 class NovelAngle(nn.Module):
-    def __init__(self):
+    def __init__(self, oup_dim=128):
         nn.Module.__init__(self)
 
         self.main = nn.Sequential(
@@ -67,9 +67,9 @@ class NovelAngle(nn.Module):
             nn.Tanh(),
             nn.Linear(32, 128),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(128, oup_dim),
         )
-        self.oup_dim = 128
+        self.oup_dim = oup_dim
 
     def forward(self, x):
         return self.main(x)
@@ -132,40 +132,6 @@ class RelightNet(nn.Module):
     def forward(self, x, ws):
         return self.post(self.main(x, ws))
 
-class ImageFeatureExtractor(nn.Module):
-    def __init__(self, d, inp_dim, oup_dim, mid_dim=32):
-        pass
-
-    def forward(self, inps):
-        return self.unet(inps)
-
-class RelightNetwork(nn.Module):
-    def __init__(self, num_lights, num_samples=10, sample_methods='sum', Light=None):
-        nn.Module.__init__(self)
-        maskNet = SampleNet(num_lights, num_samples)
-        feature = ImageFeatureExtractor(4, self.sample.output_dim, 32)
-        self.sampler = maskNet
-        self.relighter = RelightNet(4, self.sample.output_dim, 64)
-        self.Light = Light
-
-    def expand_ws(self, inps, ws):
-        inps = inps[:,None].expand((inps.size(0), ws.size(1),)+inps.size()[1:])
-        inps = inps.contiguous().view(inps.size(0)*inps.size(1), *inps.size()[2:]) # b*num_relight, K, f, w, h
-        return inps
-
-    def forward(self, inps, ws, alpha=5, number=10):
-        if self.train:
-            number = np.random.random(1, 11)
-
-        inps = self.sampler(inps, alpha) #(b, K, f, w, h)
-        inps = self.add_padding(inps)
-        inps = self.expand_ws(inps, ws)
-
-        ws = ws.view(-1, 2)
-        return self.relighter(inps, ws)
-
-
-
 def expand_ws(inps, ws):
     inps = inps[:,None].expand((inps.size(0), ws.size(1),)+inps.size()[1:])
     inps = inps.contiguous().view(inps.size(0)*inps.size(1), *inps.size()[2:]) # b*num_relight, K, f, w, h
@@ -187,6 +153,37 @@ class UnetExtractor(nn.Module):
     def add_state(self, old_state, new_state):
         return torch.stack((old_state, new_state), dim=0).max(dim=0)[0]
 
+class SetExtractor(UnetExtractor):
+    def init_state(self, inps):
+        state = UnetExtractor.init_state(self, inps)
+        return state[:,None,:]
+    
+    def forward(self, inps):
+        state = self.main(inps)
+        return state
+
+    def add_state(self, old_state, new_state):
+        return torch.cat((old_state, new_state[:,None]), dim=1)
+
+class SetRelighter(nn.Module):
+    def __init__(self, d, inp_dim, oup_dim):
+        nn.Module.__init__(self)
+        self.main = RelightUnit(d, inp_dim, oup_dim)
+        self.w_dim = 5
+        self.novelAngle = NovelAngle(oup_dim=5)
+        self.post = nn.Sequential(
+            nn.Conv2d(self.main.oup_dim, 128, 3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 3, 1, stride=1)
+        )
+    def forward(self, x, ws):
+        x = x[:,1:]
+        w_dim = self.novelAngle(ws)
+        dist = ((x[:, :, :self.w_dim] - w_dim[:,None,:, None, None])**2)
+        weights = nn.functional.softmax(dist.sum(dim=2), dim=1)
+        x = (x * weights[:,:,None,:,:]).sum(dim=1)
+        return self.post(self.main(x, ws))
+
 class RandomNextDirection(nn.Module):
     # the output is the mask
 
@@ -201,9 +198,6 @@ class RandomNextDirection(nn.Module):
 
         for i in range(len(inps)):
             idx.append( (np.random.randint(self.num_light),) )
-        #idx = torch.tensor(np.array(idx)).to(inps.device).long()
-        #out.scatter_(1, idx, torch.ones_like(idx).to(idx.device).float())
-        #return out.transpose(0, 1)
         return idx
 
     def add_padding(self, inps, Light):
@@ -219,9 +213,97 @@ class RandomNextDirection(nn.Module):
             ans.append( a[b[0]] )
         return torch.stack(ans, dim=0)
 
+class FixedDirection(RandomNextDirection):
+    def __init__(self, lights, dirs):
+        nn.Module.__init__(self)
+        dirs = dirs/180 * np.pi
+        t = np.sin(dirs[:,0])
+        x = np.cos(dirs[:,1]) * t
+        y = np.sin(dirs[:,1]) * t
+        dirs = np.stack((x, y), axis=1)
+        dist = ((lights[None,:, :].cpu().detach().numpy() - dirs[:,None,:])**2).sum(axis=2)
+        self.idx = dist.argmin(axis=1)
+        #print(t[2])
+        #print(lights[list(self.idx)], lights.min(dim=0), lights.max(dim=0))
+
+    def forward(self, inps, times):
+        assert times < len(self.idx)
+        ans = [(self.idx[times],) for i in range(len(inps))]
+        return ans
+
+class FixedMaskDirector(nn.Module):
+    def __init__(self, num_lights, num_samples):
+        nn.Module.__init__(self)
+        self.mask = nn.Parameter(torch.rand(num_samples, num_lights))
+        self.alpha = nn.Parameter(torch.tensor(1.))
+
+    def forward(self, inps, times):
+        mask = nn.functional.softmax(self.mask * self.alpha.detach(), dim=1)[times]
+        return mask
+
+    def sample(self, inps, mask):
+        return (inps * mask[None,:,None,None,None]).sum(dim=1)
+
+class EncodeNet(nn.Module):
+    def __init__(self, step, inp_dim=5, start=32):
+        nn.Module.__init__(self)
+        layers = []
+        for i in range(step):
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(inp_dim, start, 3, stride=2, padding=1),
+                    nn.ReLU(),
+                )
+            )
+            inp_dim = start
+            start = start * 2
+        self.main = nn.Sequential(*layers)
+        self.output_dim = inp_dim
+
+    def forward(self, x):
+        x = self.main(x)
+        x = x.mean(dim=3).mean(dim=2)
+        return x
+
+class AdatpiveMaskDecoder(nn.Module):
+    def __init__(self, num_lights, num_samples, inp_dim=37):
+        nn.Module.__init__(self)
+        self.mask = nn.Parameter(torch.rand(num_samples, num_lights))
+        self.alpha = nn.Parameter(torch.tensor(1.))
+        self.unet = []
+        for i in range(4):
+            net = EncodeNet(4, inp_dim=inp_dim, start=64)
+            self.unet.append(
+                nn.Sequential(
+                    net,
+                    nn.Linear(net.output_dim, num_lights)
+                )
+            )
+        self.unet = nn.ModuleList(self.unet)
+
+    def forward(self, inps, times):
+        mask = self.unet[times](inps)
+        mask = nn.functional.softmax(mask * self.alpha.detach(), dim=1)
+        return mask
+
+    def sample(self, inps, mask):
+        return (inps * mask[:,:,None,None,None]).sum(dim=1)
+
+
+def test_fixed_direction():
+    from utils import getLight
+    lights = getLight(45)
+    dirs = [
+        [21, 86],
+        [32, 171],
+        [31, 351],
+        [24, 266],
+    ]
+    net = FixedDirection(lights, np.array(dirs))
 
 def test_random_next_direction():
     a = RandomNextDirection(8)
     t = torch.zeros(100, 1).cuda()
     print(a(t))
 #test_random_next_direction()
+test_fixed_direction()

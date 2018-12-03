@@ -7,12 +7,12 @@ import argparse
 
 from utils import getLight, resume_if_exists, Visualizer, handle_data, viewDirection, save
 from dataloader import get_train_data
-from network2 import UnetExtractor, RelightNet, expand_ws
-from samplers import Sampler, FixedDirector, add_padding
+from network2 import UnetExtractor, RelightNet, expand_ws, FixedMaskDirector, AdatpiveMaskDecoder
+from samplers import Sampler, add_padding
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', type=str, default='exp/sampler')
+    parser.add_argument('--path', type=str, default='exp/set_adatpive')
     parser.add_argument('--num_sample', type=int, default=4)
 
     parser.add_argument('--lr', type=float, default=0.0001)
@@ -31,7 +31,7 @@ def main():
     extractor = UnetExtractor(4, 5, 32).cuda()
     relighter = RelightNet(4, extractor.output_dim, 64).cuda()
 
-    director = FixedDirector(len(light), args.num_sample).cuda()
+    director = AdatpiveMaskDecoder(len(light), args.num_sample).cuda()
 
     net_dic = torch.load('/home/hza/rendering/exp/max_relighter/ckpt.t7')
 
@@ -39,6 +39,8 @@ def main():
     relighter.load_state_dict(net_dic['relighter'])
     extractor.eval()
     relighter.eval()
+    for i in nn.ModuleList([extractor, relighter]).parameters():
+        i.requires_grad = False
 
     optim = torch.optim.Adam(director.parameters(), 0.0001)
 
@@ -61,12 +63,18 @@ def main():
     args.num_light = len(light)
     data = get_train_data(num_workers = args.num_workers, batch_size=args.num_scene, path=args.dataset_path, degree=args.degree, num_split=args.num_gt)
 
+    director.alpha.requires_grad = False
     for epoch_id in range(start_epoch+1, args.num_epochs):
 
         b = data.__iter__()
         num_batchs = len(b)
 
         for batch_id in tqdm.trange(num_batchs):
+            ids = (epoch_id + float(batch_id)/num_batchs)
+            T = 1 + 5 * (ids+ 0.0) ** 2.0
+            director.alpha.copy_(torch.tensor(T))
+            #print(T)
+
             tmp = next(b)
             inps, gts, ws = handle_data(tmp, light)
             inps = add_padding(inps, light)
@@ -81,14 +89,13 @@ def main():
             for j in range(num_samples):
                 next_directions_mask = director(state, j)
                 masks.append(next_directions_mask)
-                sampled_image, logp = sampler(inps, next_directions_mask)
-                logp_ = logp_ + logp
+                sampled_image = director.sample(inps, next_directions_mask)
 
                 new_state = extractor(sampled_image)
                 state = extractor.add_state(state, new_state)
 
             state = expand_ws(state, ws)
-            masks = torch.stack(masks, dim=1).detach()[0].transpose(1, 0)
+            masks = torch.stack(masks, dim=2).detach()
 
             ws = ws.view(-1, 2)
             assert state.shape[0] == ws.shape[0]
@@ -98,12 +105,8 @@ def main():
             gts = gts.view(-1, *gts.size()[2:])
             assert output.shape == gts.shape 
             loss = ((output - gts)**2).mean(dim=3).mean(dim=2).mean(dim=1)#nn.functional.mse_loss(out, gts)
-            loss = loss.detach().view(len(inps), -1)
 
-            adv = -loss.mean(dim=1)
-            prob_loss = -(adv * logp_).mean()
-
-            prob_loss.backward()
+            loss.mean().backward()
             optim.step()
 
             if batch_id % 100 == 0:
@@ -115,7 +118,7 @@ def main():
                 toshow = np.maximum(toshow, -1)
                 toshow = (toshow * 127.5 + 127.5).astype(np.uint8)
 
-                mask = [ nn.functional.softmax(masks, dim=0).cpu().detach().numpy() ]
+                mask = masks.cpu().detach().numpy()
                 imgs = []
                 for mask in mask:
                     #inds = mask.argmax(axis=0)
@@ -127,7 +130,7 @@ def main():
                     imgs.append(tmp)
                 imgs = np.float32(np.concatenate(imgs))[None,None,:]
 
-                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy(), 'prob_loss': prob_loss.mean().cpu().detach().numpy(), 'attention': imgs})
+                viewer({'img': toshow, 'loss': loss.mean().cpu().detach().numpy(), 'attention': imgs})
 
         save(args.path, zipper(), epoch_id)
 
